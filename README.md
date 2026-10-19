@@ -84,20 +84,28 @@ so one image and one checkout serve both boxes:
 
   | env part | upstream gate in v0.31 | what a Thor gains |
   |---|---|---|
-  | `MOE` | `trtllm_nvfp4_moe.py::_supports_current_device` | the trtllm-gen **NVFP4 fused MoE** (tcgen05 MMA + TMEM) for the routed experts — this model's dominant FLOPs, until now on the generic MoE path |
-  | `ATTN` | `platforms/cuda.py::_get_backend_priorities` | **FlashInfer (trtllm-gen) attention first** for causal non-MLA; the stock major-11 priority list puts FlashAttention first |
-  | `GDN` | `qwen_gdn_linear_attn.py` backend pick | the **FlashInfer GDN prefill** kernel instead of Triton/FLA (deliberately no CuteDSL — that kernel is SM100-only upstream) |
-  | `ROUTER` | `gate_linear.py::is_blackwell` | the **bf16x3 cuTe-DSL router GEMM** (JIT-compiled tcgen05 MMA) instead of plain cuBLAS |
+  | `ROUTER` (on) | `gate_linear.py::is_blackwell` | the **bf16x3 cuTe-DSL router GEMM** (JIT-compiled tcgen05 MMA) instead of plain cuBLAS — verified numerically on a Thor (0.0 max error vs fp32) |
+  | `MOE` (opt-in) | `trtllm_nvfp4_moe.py::_supports_current_device` | the trtllm-gen **NVFP4 fused MoE** (tcgen05 MMA + TMEM) for the routed experts — off by default: flashinfer 0.7.0 builds it only for SM10x/SM12x and raises "No supported CUDA architectures found" on a Thor (verified end to end); stock v0.31 already picks the Thor-safe CUTLASS fp4 MoE, which is tcgen05 too (wheel-compiled as 11.0f). Arm with `VLLM_THOR_TCGEN05_MOE=1` once flashinfer adds sm_110 |
+  | `ATTN` (opt-in) | `platforms/cuda.py::_get_backend_priorities` | **FlashInfer (trtllm-gen) attention first** — off by default: flashinfer 0.7.0 ships no sm_110 attention kernels (`supports_trtllm_attention()` is False on Thor); arm with `VLLM_THOR_TCGEN05_ATTN=1` on builds that add them |
+  | `GDN` (opt-in) | `qwen_gdn_linear_attn.py` backend pick | the FlashInfer GDN prefill kernel — off by default: it raises "GDN prefill DSL kernel is unavailable" on sm_110 (verified); Triton/FLA stays the GDN path, which is what the 227 KiB shmem build-arg optimizes. Arm with `VLLM_THOR_TCGEN05_GDN=1` |
 
-  Disable any part with `VLLM_THOR_TCGEN05_<ATTN\|MOE\|GDN\|ROUTER>=0` — `serve.sh` passes
-  those straight into the container, and the master switch is `TCGEN05=0`. On a Spark the
-  patched gates see capability 12.1 and stay off. Two Thor notes: the 128 GB pool and the
-  ~75 GiB weight math are the same as the Spark's; the CPU is not, so `CPUSET` defaults to
-  all cores there instead of the GB10's Cortex-X5 pin.
+  Force-arming a part whose kernels are missing crashes the boot — that is why the
+  verified ones default on and the rest stay stock. Disable `ROUTER` with
+  `VLLM_THOR_TCGEN05_ROUTER=0` — `serve.sh` passes every part straight into the
+  container, and the master switch is `TCGEN05=0`. On a Spark the patched gates see
+  capability 12.1 and stay off. Two Thor notes: the 128 GB pool and the ~75 GiB weight
+  math are the same as the Spark's; the CPU is not, so `CPUSET` defaults to all cores
+  there instead of the GB10's Cortex-X5 pin. And Jetson's NVIDIA container runtime
+  rejects `--gpus all` (the hook path): `serve.sh` uses `--runtime=nvidia` on detected
+  Thor boxes instead — set `DOCKER_GPU_ARGS=` if your install differs.
 
-The tcgen05 switches were built and syntax-validated against the v0.31.0 sources, but not
-yet benchmarked on real Thor hardware — measure with `bench/perf.py` before trusting them,
-and if a part regresses, switch it off by env and open an issue.
+The tcgen05 switches were built against the v0.31.0 sources and **validated on real Thor
+hardware**: the image builds with `GPU_ARCH=110a`; the bf16x3 router GEMM matches an fp32
+reference bit-for-bit at toy shapes and is the one path armed by default; the flashinfer
+tcgen05 MoE/attention/GDN kernels were probed on the device, found SM10x/SM12x-only in
+flashinfer 0.7.0 (forcing them crashes the boot), and therefore default off behind their
+env vars. Still: measure with `bench/perf.py` before trusting the numbers, and if a part
+regresses, switch it off by env and open an issue.
 
 ## Recent changes
 

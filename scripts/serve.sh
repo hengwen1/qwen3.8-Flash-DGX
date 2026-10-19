@@ -29,11 +29,17 @@
 #   EFFORT_ALIAS=1    1 = accept reasoning_effort high/max (-> xhigh) and minimal (-> low): the checkpoint's
 #                     template only takes xhigh/medium/low and 400s the rest, including Claude Code's "high"
 #   PLATFORM=auto     gb10 = DGX Spark (capability 12.1), thor = Jetson Thor (11.0); auto reads
-#                     compute_cap from nvidia-smi. Keys the CPUSET default and TCGEN05 (below)
-#   TCGEN05=auto      1 = arm the Thor tcgen05 kernel paths (Dockerfile patch 21: trtllm-gen NVFP4
-#                     fused MoE, FlashInfer-first attention, FlashInfer GDN prefill, bf16x3 router
-#                     GEMM). auto = on when a Thor is detected; inert on GB10. Per-part off:
-#                     export VLLM_THOR_TCGEN05_<ATTN|MOE|GDN|ROUTER>=0 (passed through)
+#                     compute_cap from nvidia-smi. Keys the CPUSET default, TCGEN05 and the
+#                     docker GPU flag (below)
+#   DOCKER_GPU_ARGS=  docker flag that hands the container its GPU. Default: --gpus all on GB10,
+#                     --runtime=nvidia on Thor (Jetson's runtime rejects the --gpus hook). An
+#                     empty value passes no GPU flag; any other value is used verbatim
+#   TCGEN05=auto      1 = arm the Thor tcgen05 kernel paths (Dockerfile patch 21). auto = on when a
+#                     Thor is detected; inert on GB10. Verified on sm_110a and armed by default: the
+#                     bf16x3 cuTe-DSL router GEMM. Opt-in (flashinfer 0.7.0 has no sm_110 kernels for
+#                     them — forcing any crashes the boot): VLLM_THOR_TCGEN05_MOE=1 (trtllm-gen NVFP4
+#                     MoE), VLLM_THOR_TCGEN05_ATTN=1 (trtllm-gen attention), VLLM_THOR_TCGEN05_GDN=1
+#                     (FlashInfer GDN prefill); any part: =0 disables
 #   LOG_REQUESTS=0    1 = log every prompt and output (--enable-log-requests --enable-log-outputs, DEBUG on
 #                     vLLM's request logger only) for tools/vllm_watch.py. Debugging only: privacy + unbounded logs
 #   SERVED_MODEL_NAME=qwen3.8-flash-next   model name exposed by the OpenAI-compatible API
@@ -266,15 +272,24 @@ SSM_ARGS=()
 
 DETENV=(); [ "$DET_TOPK" = 1 ] && DETENV=(-e VLLM_QSA_DET_TOPK=1 -e VLLM_QSA_DET_LIB=/opt/llm/kernel-det/_C_det.so)
 # TCGEN05 (Thor only): arms the tcgen05 kernel paths patched in by Dockerfile
-# patch 21 — FlashInfer-first attention priorities, the trtllm-gen NVFP4 fused
-# MoE, the FlashInfer GDN prefill backend and the bf16x3 cuTe-DSL router GEMM.
-# auto = on when a Thor is detected. Inert on GB10 (the patch also checks the
-# compute capability), and every part can be disabled individually by exporting
-# VLLM_THOR_TCGEN05_<ATTN|MOE|GDN|ROUTER>=0, which is passed through below.
+# patch 21. auto = on when a Thor is detected; inert on GB10 (the patch also
+# checks the compute capability). Armed by default on Thor: the bf16x3 cuTe-DSL
+# router GEMM — the one tcgen05 path verified on sm_110a today. The other three
+# wait on flashinfer gaining sm_110 kernels (its 0.7.0 trtllm-gen MoE/attention
+# and GDN DSL are SM10x/SM12x only, and crash a Thor boot if forced): export
+# VLLM_THOR_TCGEN05_<MOE|ATTN|GDN>=1 to arm any of them once your flashinfer
+# has them, or =0 to disable the router; all are passed through below.
 TCGEN05="${TCGEN05:-auto}"
 if [ "$TCGEN05" = auto ]; then
   if [ "$IS_THOR" = 1 ]; then TCGEN05=1; else TCGEN05=0; fi
 fi
+# Jetson's nvidia-container-runtime rejects the --gpus all hook path outright
+# ("invoking the NVIDIA Container Runtime Hook directly is not supported");
+# the runtime path is the one that works there. GB10 keeps --gpus all.
+# DOCKER_GPU_ARGS overrides both (empty value = no GPU flag at all).
+GPU_ARGS="--gpus all"
+if [ -n "${DOCKER_GPU_ARGS+x}" ]; then [ -n "$DOCKER_GPU_ARGS" ] && GPU_ARGS="$DOCKER_GPU_ARGS"; 
+elif [ "$IS_THOR" = 1 ]; then GPU_ARGS="--runtime=nvidia"; fi
 THORENV=()
 [ "$TCGEN05" = 1 ] && THORENV=(-e VLLM_THOR_TCGEN05=1)
 for THORPART in ATTN MOE GDN ROUTER; do
@@ -373,7 +388,7 @@ docker rm -f "$NAME" >/dev/null 2>&1 || true
 trap 'rc=$?; [ $rc -ne 0 ] && docker rm -f "$NAME" >/dev/null 2>&1; exit $rc' EXIT
 # shellcheck disable=SC2086
 docker run -d --name "$NAME" --restart unless-stopped \
-  --gpus all --ipc=host --shm-size 16g -p "${PORT}:8000" \
+  ${GPU_ARGS} --ipc=host --shm-size 16g -p "${PORT}:8000" \
   "${CPU_ARGS[@]}" \
   -v "$HF_CACHE:/hf" -e HF_HOME=/hf -e HF_HUB_OFFLINE=1 \
   "${PROM_ARGS[@]}" \
