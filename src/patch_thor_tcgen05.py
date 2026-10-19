@@ -14,21 +14,35 @@ This patch extends four of those gates to capability family 110 behind runtime
 environment checks. Inert by default and on any other GPU: the injected
 expressions require ``VLLM_THOR_TCGEN05=1`` AND family 110. serve.sh sets the
 variable automatically on detected Thor boxes; disable per part with
-``VLLM_THOR_TCGEN05_<PART>=0``:
+``VLLM_THOR_TCGEN05_<PART>=0`` (or arm the opt-in parts with =1):
 
   ATTN    platforms/cuda.py::_get_backend_priorities
           FlashInfer (trtllm-gen tcgen05 attention) first for causal non-MLA.
-          If FlashInfer misbehaves: VLLM_THOR_TCGEN05_ATTN=0 (or the stock
-          VLLM_ATTENTION_BACKEND=FLASH_ATTN).
+          DEFAULT OFF: flashinfer 0.7.0 has no sm_110 trtllm-gen attention
+          kernels (supports_trtllm_attention() is False on a Thor, prefill and
+          decode). Arm with VLLM_THOR_TCGEN05_ATTN=1 only on flashinfer builds
+          that add them; stock FlashAttention remains the attention path.
   MOE     fused_moe/experts/trtllm_nvfp4_moe.py::_supports_current_device
-          trtllm-gen NVFP4 fused MoE for the routed experts. The biggest win:
-          the experts dominate this model's FLOPs.
+          trtllm-gen NVFP4 fused MoE for the routed experts — the biggest win
+          where it exists (the experts dominate this model's FLOPs).
+          DEFAULT OFF: flashinfer 0.7.0 ships the trtllm-gen MoE only for
+          SM10x/SM12x (its JIT builds for majors [10, 12] and raises "No
+          supported CUDA architectures found" on a Thor — verified end to
+          end). Stock v0.31 already picks the best Thor-safe NvFp4 backend
+          (CUTLASS fp4, tcgen05, compiled into the wheel as 11.0f). Arm with
+          VLLM_THOR_TCGEN05_MOE=1 when the installed flashinfer adds sm_110.
   GDN     mamba/gdn/qwen_gdn_linear_attn.py GDN backend selection
-          FlashInfer GDN prefill on sm_110a. No CuteDSL here — the in-tree
-          CuteDSL GDN kernel is SM100-only (upstream's own comment).
+          FlashInfer GDN prefill on sm_110a. DEFAULT OFF: the flashinfer GDN
+          DSL kernel raises "GDN prefill DSL kernel is unavailable" on sm_110
+          (verified on real hardware); Triton/FLA remains the GDN path there —
+          which is what the 227 KiB FLA shared-memory build-arg optimizes.
+          Arm with VLLM_THOR_TCGEN05_GDN=1 on flashinfer builds that add it.
   ROUTER  fused_moe/router/gate_linear.py::is_blackwell
-          bf16x3 cuTe-DSL router GEMM (JIT-compiled, tcgen05 MMA). First thing
-          to turn off (VLLM_THOR_TCGEN05_ROUTER=0) if a Thor boot fails.
+          bf16x3 cuTe-DSL router GEMM (JIT-compiled, tcgen05 MMA). Verified
+          numerically on a Thor (matches an fp32 reference to 0.0 max err) and
+          is the one tcgen05 path armed by default today. First thing to turn
+          off (VLLM_THOR_TCGEN05_ROUTER=0) if a Thor boot fails on a different
+          flashinfer build.
 
 Usage:
   python3 patch_thor_tcgen05.py <cuda.py> <trtllm_nvfp4_moe.py> \
@@ -48,12 +62,14 @@ def _thor_tcgen05(part: str) -> bool:
     disabled with VLLM_THOR_TCGEN05_<PART>=0. Only meaningful when the
     calling expression also matches capability family 110 (Thor); returns
     False everywhere else, so the patch is inert on GB10/Spark and upstream
-    hardware. Defined here because vLLM gates these paths at import time of
-    each module, before any engine config exists."""
+    hardware. Parts whose flashinfer kernels do not exist for sm_110 yet
+    (attention, GDN prefill, as of flashinfer 0.7.0) default off and are
+    armed explicitly with VLLM_THOR_TCGEN05_<PART>=1."""
     import os as _os
     if _os.environ.get("VLLM_THOR_TCGEN05", "") != "1":
         return False
-    return _os.environ.get("VLLM_THOR_TCGEN05_" + part, "1") != "0"
+    default = {"ATTN": "0", "GDN": "0", "MOE": "0"}.get(part, "1")
+    return _os.environ.get("VLLM_THOR_TCGEN05_" + part, default) == "1"
 # ---- end {marker} ----
 '''
 
