@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Serve Qwen3.8-Flash-Next on a single DGX Spark / GB10 with the PLE table mmapped
-# from disk. OpenAI-compatible API on $PORT.
+# Serve Qwen3.8-Flash-Next on a single DGX Spark / GB10 or Jetson Thor (sm_110a)
+# with the PLE table mmapped from disk. OpenAI-compatible API on $PORT.
 #
 #   scripts/serve.sh                          # NVFP4 checkpoint as published, 262k ctx
 #   MODE=hybrid scripts/serve.sh              # NVFP4 experts + fp8 side layers (scripts/prepare-hybrid.sh first)
@@ -28,6 +28,12 @@
 #                     overlap (+8% decode at 1 stream, +17% aggregate at 4, README); 512 = old inline path
 #   EFFORT_ALIAS=1    1 = accept reasoning_effort high/max (-> xhigh) and minimal (-> low): the checkpoint's
 #                     template only takes xhigh/medium/low and 400s the rest, including Claude Code's "high"
+#   PLATFORM=auto     gb10 = DGX Spark (capability 12.1), thor = Jetson Thor (11.0); auto reads
+#                     compute_cap from nvidia-smi. Keys the CPUSET default and TCGEN05 (below)
+#   TCGEN05=auto      1 = arm the Thor tcgen05 kernel paths (Dockerfile patch 21: trtllm-gen NVFP4
+#                     fused MoE, FlashInfer-first attention, FlashInfer GDN prefill, bf16x3 router
+#                     GEMM). auto = on when a Thor is detected; inert on GB10. Per-part off:
+#                     export VLLM_THOR_TCGEN05_<ATTN|MOE|GDN|ROUTER>=0 (passed through)
 #   LOG_REQUESTS=0    1 = log every prompt and output (--enable-log-requests --enable-log-outputs, DEBUG on
 #                     vLLM's request logger only) for tools/vllm_watch.py. Debugging only: privacy + unbounded logs
 #   SERVED_MODEL_NAME=qwen3.8-flash-next   model name exposed by the OpenAI-compatible API
@@ -82,9 +88,29 @@ PORT="${PORT:-18300}"
 CTX="${CTX:-262144}"
 YARN="${YARN:-0}"
 SEQS="${SEQS:-8}"
+# Platform: gb10 (DGX Spark, capability 12.1, sm_121) or thor (Jetson Thor,
+# capability 11.0, sm_110a). auto = read compute_cap from nvidia-smi; the
+# tcgen05 enablement and the CPUSET default below key off it. A box without
+# nvidia-smi falls back to gb10 behavior (set PLATFORM=thor explicitly there).
+PLATFORM="${PLATFORM:-auto}"
+if [ "$PLATFORM" = auto ]; then
+  CAP="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' .')"
+  case "$CAP" in
+    11*) PLATFORM=thor ;;
+    12*) PLATFORM=gb10 ;;
+    *)   PLATFORM=gb10 ;;
+  esac
+fi
+IS_THOR=0; [ "$PLATFORM" = thor ] && IS_THOR=1
 # Default: pin to the Cortex-X5 performance cores (the 27B sibling recipe's
-# measured config). Set CPUSET= (empty) to let the container use all 20 cores.
-CPUSET="${CPUSET-5-9,15-19}"
+# measured config). On GB10 the high cores 5-9,15-19 are the Cortex-X5 cluster;
+# the SGLang sibling recipe (aphex3k/Qwen3.8-27B-on-DGX-Spark) pinned its process
+# there and kept the numbers in the table they publish. On Thor the CPU layout
+# differs, so the default there is all cores (CPUSET= ). Set CPUSET= (empty) to
+# let a GB10 container use all 20 cores, or CPUSET=<list> for anything else.
+if [ "${CPUSET+x}" != x ]; then
+  if [ "$IS_THOR" = 1 ]; then CPUSET=""; else CPUSET="5-9,15-19"; fi
+fi
 MAMBA_SSM_DTYPE="${MAMBA_SSM_DTYPE:-}"
 GPU_MEM="${GPU_MEM:-0.80}"
 MTP="${MTP:-2}"
@@ -239,6 +265,23 @@ SSM_ARGS=()
 [ -n "$MAMBA_SSM_DTYPE" ] && SSM_ARGS=(--mamba-ssm-cache-dtype "$MAMBA_SSM_DTYPE")
 
 DETENV=(); [ "$DET_TOPK" = 1 ] && DETENV=(-e VLLM_QSA_DET_TOPK=1 -e VLLM_QSA_DET_LIB=/opt/llm/kernel-det/_C_det.so)
+# TCGEN05 (Thor only): arms the tcgen05 kernel paths patched in by Dockerfile
+# patch 21 — FlashInfer-first attention priorities, the trtllm-gen NVFP4 fused
+# MoE, the FlashInfer GDN prefill backend and the bf16x3 cuTe-DSL router GEMM.
+# auto = on when a Thor is detected. Inert on GB10 (the patch also checks the
+# compute capability), and every part can be disabled individually by exporting
+# VLLM_THOR_TCGEN05_<ATTN|MOE|GDN|ROUTER>=0, which is passed through below.
+TCGEN05="${TCGEN05:-auto}"
+if [ "$TCGEN05" = auto ]; then
+  if [ "$IS_THOR" = 1 ]; then TCGEN05=1; else TCGEN05=0; fi
+fi
+THORENV=()
+[ "$TCGEN05" = 1 ] && THORENV=(-e VLLM_THOR_TCGEN05=1)
+for THORPART in ATTN MOE GDN ROUTER; do
+  THORVAR="VLLM_THOR_TCGEN05_${THORPART}"
+  THORVAL="${!THORVAR:-}"
+  [ -n "$THORVAL" ] && THORENV+=(-e "${THORVAR}=$THORVAL")
+done
 case "$DRAFT_VOCAB" in
   0|"") ;;
   1) DETENV+=(-e VLLM_MTP_DRAFT_VOCAB=/opt/llm/draft_vocab_65536.npy) ;;
@@ -337,7 +380,7 @@ docker run -d --name "$NAME" --restart unless-stopped \
   "${ALLOCATOR_ENV[@]}" \
   "${CACHE_MNT[@]}" "${TEMPLATE_MNT[@]}" "${LOG_MNT[@]}" \
   -e VLLM_PLE_MMAP=1 -e VLLM_PLE_MMAP_WORKERS="${WORKERS:-32}" -e VLLM_PLE_MMAP_PREWARM="$PREWARM" \
-  -e VLLM_QSA_EXACT_TOPK="$EXACT_TOPK" "${DETENV[@]}" \
+  -e VLLM_QSA_EXACT_TOPK="$EXACT_TOPK" "${DETENV[@]}" "${THORENV[@]}" \
   -e VLLM_USE_FLASHINFER_SAMPLER=1 -e VLLM_ALLOW_LONG_MAX_MODEL_LEN="$ALLOW_LONG" \
   "${HYBRID_ENV[@]}" \
   "$IMAGE" \
@@ -368,6 +411,6 @@ case "$STATE" in
     ;;
 esac
 
-echo ">> $NAME starting on :$PORT (model '$SERVED_MODEL_NAME', mode=$MODE, ctx $CTX, yarn=$YARN, mtp=$MTP, seqs=$SEQS, prefix_cache=$PREFIX_CACHE, det_topk=$DET_TOPK, exact_topk=$EXACT_TOPK, draft_vocab=$DRAFT_VOCAB, madvise=$MADVISE, fast_rows=$FAST_ROWS, effort_alias=$EFFORT_ALIAS_STATE${CPUSET:+, cpuset=$CPUSET}${MAMBA_SSM_DTYPE:+, ssm_dtype=$MAMBA_SSM_DTYPE}${COMPILE_CACHE:+, compile_cache=$COMPILE_CACHE})"
+echo ">> $NAME starting on :$PORT (platform=$PLATFORM, tcgen05=$TCGEN05, model '$SERVED_MODEL_NAME', mode=$MODE, ctx $CTX, yarn=$YARN, mtp=$MTP, seqs=$SEQS, prefix_cache=$PREFIX_CACHE, det_topk=$DET_TOPK, exact_topk=$EXACT_TOPK, draft_vocab=$DRAFT_VOCAB, madvise=$MADVISE, fast_rows=$FAST_ROWS, effort_alias=$EFFORT_ALIAS_STATE${CPUSET:+, cpuset=$CPUSET}${MAMBA_SSM_DTYPE:+, ssm_dtype=$MAMBA_SSM_DTYPE}${COMPILE_CACHE:+, compile_cache=$COMPILE_CACHE})"
 echo ">> first boot loads ~75 GiB of weights (~3-4 min). Follow:  docker logs -f $NAME"
 echo ">> ready when the log says 'Application startup complete'. Then: scripts/smoke-test.sh"

@@ -1,4 +1,4 @@
-# Qwen3.8-Flash-Next on a single DGX Spark (GB10)
+# Qwen3.8-Flash-Next on a single DGX Spark (GB10) — or a Jetson Thor (sm_110a)
 
 Run **Qwen3.8-Flash-Next** — a ~176B-parameter model (125B main + 51B n-gram, 6B
 active) — on **one NVIDIA DGX Spark / ASUS GX10** with **vLLM**, at full prefill
@@ -62,6 +62,42 @@ Everything below is the long version: what was broken on GB10, what was fixed, a
 > [@jschmied](https://github.com/jschmied) — see
 > [issue #1](https://github.com/blazux/qwen3.8-Flash-DGX/issues/1) and their
 > [write-up](https://github.com/jschmied/qwen38-flash-next-gb10).
+
+## Jetson Thor (sm_110a): the tcgen05 recipe
+
+The same recipe runs on a **Jetson Thor** (compute capability 11.0, `sm_110a`) with two
+arch-specific switches. Both are automatic on detected Thor hardware and inert on a GB10,
+so one image and one checkout serve both boxes:
+
+- **The image is built for the GPU it runs on.** `./flash setup` reads the compute
+  capability and builds with `--build-arg GPU_ARCH=110a` (Spark boxes keep `121a`; export
+  `GPU_ARCH=` to override). That compiles the deterministic top-k kernel as `sm_110a`, and
+  raises the FLA Triton shared-memory gate from the GB10's 99 KiB to Thor's full 227 KiB
+  Blackwell budget — the big GDN tiles fit whole instead of being split.
+- **The tcgen05 kernel paths arm themselves at serve time.** vLLM v0.31 steers every
+  Blackwell-class tcgen05 kernel through sm_10x-only gates
+  (`is_device_capability_family(100)`, `major == 10`), so a Thor silently falls back to
+  slower generic kernels even though the wheel already ships `sm_110f` cubins. Dockerfile
+  patch 21 re-wires four of those gates behind an env check (`VLLM_THOR_TCGEN05=1` AND
+  capability family 110); `scripts/serve.sh` sets that env when it detects a Thor
+  (`TCGEN05=auto`, echoed in the startup line; the `thor` profile pins it). Per part:
+
+  | env part | upstream gate in v0.31 | what a Thor gains |
+  |---|---|---|
+  | `MOE` | `trtllm_nvfp4_moe.py::_supports_current_device` | the trtllm-gen **NVFP4 fused MoE** (tcgen05 MMA + TMEM) for the routed experts — this model's dominant FLOPs, until now on the generic MoE path |
+  | `ATTN` | `platforms/cuda.py::_get_backend_priorities` | **FlashInfer (trtllm-gen) attention first** for causal non-MLA; the stock major-11 priority list puts FlashAttention first |
+  | `GDN` | `qwen_gdn_linear_attn.py` backend pick | the **FlashInfer GDN prefill** kernel instead of Triton/FLA (deliberately no CuteDSL — that kernel is SM100-only upstream) |
+  | `ROUTER` | `gate_linear.py::is_blackwell` | the **bf16x3 cuTe-DSL router GEMM** (JIT-compiled tcgen05 MMA) instead of plain cuBLAS |
+
+  Disable any part with `VLLM_THOR_TCGEN05_<ATTN\|MOE\|GDN\|ROUTER>=0` — `serve.sh` passes
+  those straight into the container, and the master switch is `TCGEN05=0`. On a Spark the
+  patched gates see capability 12.1 and stay off. Two Thor notes: the 128 GB pool and the
+  ~75 GiB weight math are the same as the Spark's; the CPU is not, so `CPUSET` defaults to
+  all cores there instead of the GB10's Cortex-X5 pin.
+
+The tcgen05 switches were built and syntax-validated against the v0.31.0 sources, but not
+yet benchmarked on real Thor hardware — measure with `bench/perf.py` before trusting them,
+and if a part regresses, switch it off by env and open an issue.
 
 ## Recent changes
 
@@ -295,6 +331,8 @@ to `qwen38-flash` and `18300`, like `serve.sh`.
 
 - An **NVIDIA DGX Spark or compatible GB10 (sm_121)** box, 128 GB unified memory,
   aarch64, recent NVIDIA driver, Docker with the NVIDIA container runtime.
+  A **Jetson Thor (sm_110a)** works too — see [the tcgen05 recipe](#jetson-thor-sm_110a-the-tcgen05-recipe);
+  the setup auto-detects which one it is on.
 - **~140 GB free disk** for the checkpoint (+13 GB for the hybrid variant, +5 GB more
   for the NVFP4-MTP graft), on
   reasonably fast storage (the table is read from it at runtime — NVMe strongly

@@ -1,15 +1,21 @@
-# Qwen3.8-Flash-Next on a DGX Spark — the official vLLM v0.31.0 image plus these patches:
+# Qwen3.8-Flash-Next on a DGX Spark / Jetson Thor — the official vLLM v0.31.0 image plus these patches:
 #   1 PLE mmap, 2 GB10 FLA fixes, 4 prefix-caching block_size fix, 5 exact top-k, 6 hybrid mode,
 #   8 deterministic top-k kernel, 10 reduced draft vocabulary, 12 Qwen tool preamble fix,
 #   13 quoted Qwen tool markers stay text, 14 MoE weight-load clone (#33), 15-18 the rest of weight
 #   loading (pread, chunked embedding copy, MTP name prefilter), 19 token identity and Responses output,
-#   20 isolate the MTP drafter from target auxiliary outputs.
+#   20 isolate the MTP drafter from target auxiliary outputs, 21 opt-in Thor tcgen05 paths.
 # Upstream now: 3 (vllm#50729), 7 (vllm#55557), 9 (vllm#52775),
 # 11 (vllm#55513), 16 (vllm#58720). Older bases remain in git history.
 #
-#   docker build -t qwen38-flash-dgx:v0.31 .
+# GPU targets (build-arg GPU_ARCH, auto-set by ./flash setup):
+#   121a  DGX Spark / GB10 (default; the sm_121 det-kernel and 99 KiB FLA shmem gate)
+#   110a  Jetson Thor      (sm_110a det-kernel + full 227 KiB Blackwell FLA shmem gate;
+#                          tcgen05 kernel paths are runtime env-gated by patch 21)
+#
+#   docker build -t qwen38-flash-dgx:v0.31 [--build-arg GPU_ARCH=110a] .
 FROM vllm/vllm-openai:v0.31.0
 LABEL qwen38.base=v0.31
+ARG GPU_ARCH=121a
 ARG SP=/usr/local/lib/python3.12/dist-packages
 ARG PKG=${SP}/vllm/models/qwen4_exp/nvidia
 ARG PLE=${PKG}/ngram_embedding.py
@@ -20,11 +26,15 @@ RUN cp ${PLE} ${PLE}.orig \
  && printf '\n\n# --- qwen38-flash-dgx: serve the PLE n-gram table from disk (VLLM_PLE_MMAP=1) ---\nfrom vllm_ple_mmap import apply as _ple_mmap_apply\n_ple_mmap_apply(Qwen4ExpNGramEmbedding)\n' >> ${PLE} \
  && python3 -c "import ast; ast.parse(open('${PLE}').read()); print('ngram_embedding.py patched OK')"
 
-# --- 2. GB10 FLA fixes (@Saren-Arterius) ---
+# --- 2. GB10/Thor FLA fixes (@Saren-Arterius) ---
 ARG FLA_UTILS=${SP}/vllm/third_party/flash_linear_attention/ops/utils.py
 ARG FLA_CDH=${SP}/vllm/third_party/flash_linear_attention/ops/chunk_delta_h.py
-RUN sed -i 's|DEFAULT = 102400|DEFAULT = 101376  # spark-fla-shmem: GB10 99KiB, big GDN tiles fit|' ${FLA_UTILS} \
- && grep -q "spark-fla-shmem" ${FLA_UTILS} && echo "fla shmem gate patched" \
+# Per-SM dynamic-shared-memory budget the FLA autotuner may assume: GB10 (sm_121)
+# exposes 99 KiB; Thor (sm_110) has the full Blackwell layout, 227 KiB per block —
+# the big GDN tiles fit whole instead of being split (FLA_SMEM_DEFAULT build-arg).
+ARG FLA_SMEM_DEFAULT=101376
+RUN sed -i "s|DEFAULT = 102400|DEFAULT = ${FLA_SMEM_DEFAULT}  # spark-fla-shmem: arch shmem budget, big GDN tiles fit|" ${FLA_UTILS} \
+ && grep -q "spark-fla-shmem" ${FLA_UTILS} && echo "fla shmem gate patched (${FLA_SMEM_DEFAULT})" \
  && sed -i 's|for num_warps in \[2, 4\]|for num_warps in [2]  # spark-fla-warps: fla#953 Blackwell tl.dot race|' ${FLA_CDH} \
  && grep -q "spark-fla-warps" ${FLA_CDH} && echo "fla num_warps pinned"
 
@@ -60,7 +70,7 @@ RUN grep -q 'IS_FP8=is_fp8' ${PKG}/ops/qsa.py && grep -q '"fp8_e4m3"' ${QSA}
 # still needs this one is re-measured by scripts/smoke-test.sh (determinism) on every boot.
 ARG KDET_SHA=e0ef69d4f5575dad00d34e05479eaf4c6547bace
 ARG KDET=https://raw.githubusercontent.com/jschmied/qwen38-flash-next-gb10/${KDET_SHA}
-ARG DET_ARCH=121a
+ARG DET_ARCH=${GPU_ARCH}
 ADD --checksum=sha256:138cacfc5eb117f0922d53c88727e4d0dc26dcfb246c3d401fc280cfc726cc71 ${KDET}/patches/kernel-det/build_det.py /opt/llm/kernel-det/src/build_det.py
 ADD --checksum=sha256:b103fbeaf7589b9468471142ad0b30012a076f93d20ba11fc5ff6dcb1ecd32a6 ${KDET}/patches/kernel-det/bindings_det.cpp /opt/llm/kernel-det/src/bindings_det.cpp
 ADD --checksum=sha256:19e1d53425ea9a839445722fd1dac1c41727128eebdce84508c1bfb8592afecf ${KDET}/patches/kernel-det/topk_det.cu /opt/llm/kernel-det/src/topk_det.cu
@@ -121,3 +131,19 @@ RUN python3 /tmp/patch_load_pread.py ${SP} \
 COPY src/patches/qwen-mtp-aux-output.patch /tmp/qwen-mtp-aux-output.patch
 RUN cd ${SP} && patch --batch --forward --fuzz=0 -p1 < /tmp/qwen-mtp-aux-output.patch \
  && rm /tmp/qwen-mtp-aux-output.patch
+
+# --- 21. Opt-in tcgen05 kernel paths on Jetson Thor (sm_110a; VLLM_THOR_TCGEN05=1) ---
+# v0.31 gates every Blackwell tcgen05 kernel on sm_10x (family(100)) or major==10, so a
+# Thor silently gets the slow generic fallbacks even though the wheel ships sm_110f
+# cubins. This wires four gates behind runtime env checks — FlashInfer-first attention
+# priorities, the trtllm-gen NVFP4 fused MoE, the FlashInfer GDN prefill backend and the
+# bf16x3 cuTe-DSL router GEMM — each requiring capability family 110 AND the env var, so
+# it is inert on GB10 and on every upstream GPU without VLLM_THOR_TCGEN05=1.
+# scripts/serve.sh sets the env automatically on detected Thor boxes (TCGEN05=auto).
+COPY src/patch_thor_tcgen05.py /tmp/patch_thor_tcgen05.py
+RUN python3 /tmp/patch_thor_tcgen05.py \
+      ${SP}/vllm/platforms/cuda.py \
+      ${SP}/vllm/model_executor/layers/fused_moe/experts/trtllm_nvfp4_moe.py \
+      ${SP}/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py \
+      ${SP}/vllm/model_executor/layers/fused_moe/router/gate_linear.py \
+ && rm /tmp/patch_thor_tcgen05.py
