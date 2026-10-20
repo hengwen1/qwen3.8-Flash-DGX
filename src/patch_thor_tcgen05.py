@@ -10,7 +10,7 @@ prefill kernel, and cuBLAS for the MoE router GEMM. The wheel itself already
 ships sm_110f cubins (CMake builds ``11.0f`` on CUDA >= 13), so the kernels
 are there — only the gates keep them off.
 
-This patch extends four of those gates to capability family 110 behind runtime
+This patch extends five of those gates to capability family 110 behind runtime
 environment checks. Inert by default and on any other GPU: the injected
 expressions require ``VLLM_THOR_TCGEN05=1`` AND family 110. serve.sh sets the
 variable automatically on detected Thor boxes; disable per part with
@@ -22,15 +22,27 @@ variable automatically on detected Thor boxes; disable per part with
           kernels (supports_trtllm_attention() is False on a Thor, prefill and
           decode). Arm with VLLM_THOR_TCGEN05_ATTN=1 only on flashinfer builds
           that add them; stock FlashAttention remains the attention path.
-  MOE     fused_moe/experts/trtllm_nvfp4_moe.py::_supports_current_device
-          trtllm-gen NVFP4 fused MoE for the routed experts — the biggest win
-          where it exists (the experts dominate this model's FLOPs).
-          DEFAULT OFF: flashinfer 0.7.0 ships the trtllm-gen MoE only for
-          SM10x/SM12x (its JIT builds for majors [10, 12] and raises "No
-          supported CUDA architectures found" on a Thor — verified end to
-          end). Stock v0.31 already picks the best Thor-safe NvFp4 backend
-          (CUTLASS fp4, tcgen05, compiled into the wheel as 11.0f). Arm with
-          VLLM_THOR_TCGEN05_MOE=1 when the installed flashinfer adds sm_110.
+  MOE     fused_moe/experts/flashinfer_cutlass_moe.py::_supports_current_device
+          FLASHINFER_CUTLASS NvFp4 MoE — flashinfer's CUTLASS fused MoE JITs
+          from source for the detected arch, and its sm100 module already
+          accepts major 11 ("110" routes to gen_cutlass_fused_moe_sm100_module,
+          supported_major_versions=[10, 11]; verified to compile and execute
+          on a Thor). Upstream v0.31 excludes SM110 here citing
+          flashinfer-ai/flashinfer#3134; this gate re-arms family 110 behind
+          the env check. DEFAULT OFF like the other flashinfer parts.
+          NOTE: the first boot JIT-compiles the module (~25 min, several GB of
+          RAM — on a Thor's unified memory that MUST NOT happen next to a
+          loaded engine); pre-build with bench/probe_fi_cutlass_moe.py into a
+          COMPILE_CACHE volume, which serve.sh wires up, or expect the boot
+          to OOM. Arm with VLLM_THOR_TCGEN05_MOE=1.
+  MOE_TRTLLM
+          fused_moe/experts/trtllm_nvfp4_moe.py::_supports_current_device
+          The trtllm-gen NVFP4 fused MoE. DEFAULT OFF and dead on flashinfer
+          0.7.0: the BMM cubin package ships Sm100f/Sm103a/Sm107a SASS only,
+          and SASS does not cross compute-capability majors, so there is
+          nothing to load on a Thor (major 11) — arming this part crashes the
+          boot with "No supported CUDA architectures found". It stays wired
+          for flashinfer builds that add Sm110a cubins.
   GDN     mamba/gdn/qwen_gdn_linear_attn.py GDN backend selection
           FlashInfer GDN prefill on sm_110a. DEFAULT OFF: the flashinfer GDN
           DSL kernel raises "GDN prefill DSL kernel is unavailable" on sm_110
@@ -46,8 +58,9 @@ variable automatically on detected Thor boxes; disable per part with
 
 Usage:
   python3 patch_thor_tcgen05.py <cuda.py> <trtllm_nvfp4_moe.py> \
-      <qwen_gdn_linear_attn.py> <gate_linear.py>          install
-  ... off                                                 remove
+      <flashinfer_cutlass_moe.py> <qwen_gdn_linear_attn.py> \
+      <gate_linear.py>                                       install
+  ... off                                                    remove
 """
 import ast
 import sys
@@ -68,7 +81,7 @@ def _thor_tcgen05(part: str) -> bool:
     import os as _os
     if _os.environ.get("VLLM_THOR_TCGEN05", "") != "1":
         return False
-    default = {"ATTN": "0", "GDN": "0", "MOE": "0"}.get(part, "1")
+    default = {"ATTN": "0", "GDN": "0", "MOE": "0", "MOE_TRTLLM": "0"}.get(part, "1")
     return _os.environ.get("VLLM_THOR_TCGEN05_" + part, default) == "1"
 # ---- end {marker} ----
 '''
@@ -87,6 +100,9 @@ PATCHES = [
         "        ) and not use_non_causal:",
     ),
     # 2. trtllm-gen NVFP4 fused MoE (tcgen05) for the routed experts.
+    #    Dead on flashinfer 0.7.0 (no Sm110a cubins in the BMM package); kept
+    #    as its own part so VLLM_THOR_TCGEN05_MOE can arm the one flashinfer
+    #    MoE that actually runs on a Thor (FLASHINFER_CUTLASS, patch 2b).
     (
         "trtllm_nvfp4_moe.py",
         "from vllm.platforms import current_platform",
@@ -100,11 +116,48 @@ PATCHES = [
         "            and (\n"
         "                p.is_device_capability_family(100)\n"
         "                or (\n"
-        "                    _thor_tcgen05(\"MOE\")\n"
+        "                    _thor_tcgen05(\"MOE_TRTLLM\")\n"
         "                    and p.is_device_capability_family(110)\n"
         "                )\n"
         "            )\n"
         "            and has_flashinfer_trtllm_fused_moe()\n"
+        "        )",
+    ),
+    # 2b. FLASHINFER_CUTLASS NvFp4 MoE: flashinfer's CUTLASS fused MoE JITs
+    #     from source ("110" -> sm100 module, supported_major_versions=[10,
+    #     11]) — verified to compile sm_110a and execute on a Thor. Upstream
+    #     excludes SM110 citing flashinfer-ai/flashinfer#3134; re-armed here
+    #     behind the shared MOE opt-in. This is what VLLM_THOR_TCGEN05_MOE=1
+    #     buys on a Thor today.
+    (
+        "flashinfer_cutlass_moe.py",
+        "logger = init_logger(__name__)",
+        "        return (\n"
+        "            p.is_cuda()\n"
+        "            and (\n"
+        "                p.is_device_capability(90)\n"
+        "                or p.is_device_capability_family(100)\n"
+        "                # SM110 excluded: flashinfer-ai/flashinfer#3134\n"
+        "                or p.is_device_capability_family(120)\n"
+        "            )\n"
+        "            and has_flashinfer_cutlass_fused_moe()\n"
+        "        )",
+        "        return (\n"
+        "            p.is_cuda()\n"
+        "            and (\n"
+        "                p.is_device_capability(90)\n"
+        "                or p.is_device_capability_family(100)\n"
+        "                # SM110 excluded upstream: flashinfer-ai/flashinfer#3134.\n"
+        "                # thor-tcgen05: re-armed on family 110 — unlike the\n"
+        "                # trtllm-gen cubins, these CUTLASS kernels JIT from\n"
+        "                # source and the sm100 module already accepts major 11.\n"
+        "                or p.is_device_capability_family(120)\n"
+        "                or (\n"
+        "                    _thor_tcgen05(\"MOE\")\n"
+        "                    and p.is_device_capability_family(110)\n"
+        "                )\n"
+        "            )\n"
+        "            and has_flashinfer_cutlass_fused_moe()\n"
         "        )",
     ),
     # 3. FlashInfer GDN prefill backend on sm_110a (linear-attention layers).

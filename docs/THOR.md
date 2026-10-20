@@ -12,36 +12,61 @@ so one image and one checkout serve both boxes:
 - **The tcgen05 kernel paths arm themselves at serve time.** Every Blackwell-class tcgen05
   kernel is gated on sm_10x-only checks (`is_device_capability_family(100)`, `major == 10`),
   so a Thor silently falls back to slower generic kernels even though the wheel already
-  ships `sm_110f` cubins. Dockerfile patch 24 re-wires four of those gates behind an env
+  ships `sm_110f` cubins. Dockerfile patch 24 re-wires five of those gates behind an env
   check (`VLLM_THOR_TCGEN05=1` AND capability family 110); `scripts/serve.sh` sets that env
   when it detects a Thor (`TCGEN05=auto`, echoed in the startup line; the `thor` profile
   pins it). Per part:
 
   | env part | upstream gate | what a Thor gains |
   |---|---|---|
-  | `MOE` | `trtllm_nvfp4_moe.py::_supports_current_device` | the trtllm-gen **NVFP4 fused MoE** (tcgen05 MMA + TMEM) for the routed experts — this model's dominant FLOPs, until now on the generic MoE path |
-  | `ATTN` | `platforms/cuda.py::_get_backend_priorities` | **FlashInfer (trtllm-gen) attention first** for causal non-MLA; the stock major-11 priority list puts FlashAttention first |
-  | `GDN` | `qwen_gdn_linear_attn.py` backend pick | the **FlashInfer GDN prefill** kernel instead of Triton/FLA (deliberately no CuteDSL — that kernel is SM100-only upstream) |
-  | `ROUTER` | `gate_linear.py::is_blackwell` | the **bf16x3 cuTe-DSL router GEMM** (JIT-compiled tcgen05 MMA) instead of plain cuBLAS |
+  | `ROUTER` (on) | `gate_linear.py::is_blackwell` | the **bf16x3 cuTe-DSL router GEMM** (JIT-compiled tcgen05 MMA) instead of plain cuBLAS — verified numerically on a Thor (0.0 max error vs fp32) |
+  | `MOE` (**default on** for Thor serves) | `flashinfer_cutlass_moe.py::_supports_current_device` | the **FLASHINFER_CUTLASS NVFP4 fused MoE** — the one flashinfer MoE that runs on a Thor: its CUTLASS kernels JIT from source (the sm100 module accepts major 11; compiles `sm_110a`), where upstream excludes SM110 citing flashinfer-ai/flashinfer#3134. Since 2026-10-20 `serve.sh` arms it by default on detected Thor boxes (with `COMPILE_CACHE` defaulting to `~/.cache/qwen38-flash-dgx-compile`; opt out with `VLLM_THOR_TCGEN05_MOE=0`). Measured against stock `VLLM_CUTLASS` on a Thor (MODE=nvfp4 recipe, 2026-10-20, cache-clean): **+18% cold prefill** (~2,570 vs ~2,170 tok/s at 42k tokens, `bench/cold_prefill.py`), **+4% single-stream decode** (41.2 vs 39.7 tok/s), parity at concurrency (150 vs 148 tok/s peak); numerics sound (greedy outputs differ only at synonym-level tokens, 1/6 prompts bit-identical). The ~25-min JIT compile runs once in a side container that `serve.sh` launches into the cache volume — never next to a loaded engine, which Thor's unified memory OOM-kills |
+  | `MOE_TRTLLM` (opt-in, dead today) | `trtllm_nvfp4_moe.py::_supports_current_device` | the trtllm-gen **NVFP4 fused MoE** (tcgen05 MMA + TMEM) — dead on flashinfer 0.7.0: the BMM cubin package ships Sm100f/Sm103a/Sm107a SASS only and SASS does not cross compute-capability majors, so there is nothing to load on a Thor; arming it crashes the boot with "No supported CUDA architectures found". Kept wired for flashinfer builds that add Sm110a cubins |
+  | `ATTN` (opt-in) | `platforms/cuda.py::_get_backend_priorities` | **FlashInfer (trtllm-gen) attention first** — off by default: flashinfer 0.7.0 ships no sm_110 attention kernels (`supports_trtllm_attention()` is False on Thor); arm with `VLLM_THOR_TCGEN05_ATTN=1` on builds that add them |
+  | `GDN` (opt-in) | `qwen_gdn_linear_attn.py` backend pick | the FlashInfer GDN prefill kernel — off by default: it raises "GDN prefill DSL kernel is unavailable" on sm_110 (verified); Triton/FLA stays the GDN path, which is what the 227 KiB shmem build-arg optimizes. Arm with `VLLM_THOR_TCGEN05_GDN=1` |
 
-  Disable any part with `VLLM_THOR_TCGEN05_<ATTN\|MOE\|GDN\|ROUTER>=0` — `serve.sh` passes
-  those straight into the container, and the master switch is `TCGEN05=0`. On a Spark the
-  patched gates see capability 12.1 and stay off. Two Thor notes: the 128 GB pool and the
+  The table is the policy: the hardware-verified ones default on and the rest stay stock.
+  Disable `ROUTER` with `VLLM_THOR_TCGEN05_ROUTER=0` — `serve.sh` passes every part
+  straight into the container, and the master switch is `TCGEN05=0`. On a Spark the patched
+  gates see capability 12.1 and stay off. To use `VLLM_THOR_TCGEN05_MOE=1`, build the JIT
+  cache once without the engine loaded (Thor's memory is unified — nvcc next to a loaded
+  engine is an OOM): `docker run --rm --runtime=nvidia --entrypoint python3 -v
+  $PWD/bench/probe_fi_cutlass_moe.py:/tmp/probe.py:ro -v
+  <COMPILE_CACHE>/flashinfer:/root/.cache/flashinfer qwen38-flash-dgx:v0.33
+  /tmp/probe.py` (it both compiles the module and smoke-tests the kernel; copy the result
+  preserving mtimes — `cp -a` — or ninja rebuilds). Two Thor notes: the 128 GB pool and the
   ~75 GiB weight math are the same as the Spark's; the CPU is not, so `CPUSET` defaults to
   all cores there instead of the GB10's Cortex-X5 pin. And Jetson's NVIDIA container runtime
   rejects `--gpus all` (the hook path): `serve.sh` uses `--runtime=nvidia` on detected
-  Thor boxes instead — set `DOCKER_GPU_ARGS=` if your install differs. The CPU all of this runs on
-  has a knob of its own, outside the container: set the power model as in
+  Thor boxes instead — set `DOCKER_GPU_ARGS=` if your install differs. The CPU all of this
+  runs on has a knob of its own, outside the container: set the power model as in
   [Power model 4](#power-model-4-inference-the-host-side-knob), which is worth ~5% of the
   concurrent throughput here.
 
-The tcgen05 switches were built and syntax-validated against the v0.31.0 sources and
-**validated on real Thor hardware**: the image builds with `GPU_ARCH=110a`; the bf16x3
-router GEMM matches an fp32 reference; the trtllm-gen NVFP4 MoE and the FlashInfer GDN
-prefill are gated off because their kernels are not available for sm_110 in flashinfer 0.7.0
-(forcing them crashes the boot), and therefore default off behind the per-part env vars.
-Still: measure with `bench/perf.py` before trusting the numbers, and if a part regresses,
-switch it off by env and open an issue.
+  One more backend line you will see in every boot, `fp8.py: Using TRITON Fp8 MoE
+  backend`: that is the **MTP draft's experts** (`mtp.layers.0.mlp.experts`, the one
+  fp8 128-block-scale MoE layer of the hybrid checkpoint), not the main routed experts,
+  and on a Thor TRITON is the only backend whose kernels exist for that scheme — every
+  other candidate is rejected for real kernel-availability reasons, not arch-list
+  arbitrariness: flashinfer raises `NotImplementedError: FP8 block scaling not yet
+  implemented for Blackwell` for 128-block fp8 on **every** Blackwell incl. sm100
+  (verified on-device), DeepGEMM builds for families 100/120 only, and vLLM's own CUTLASS
+  fp8 MoE takes per-tensor/channel schemes only. It is also not a hang risk — every
+  benchmark above ran with it. Revisit when flashinfer implements Blackwell block-scale
+  fp8 (then extend `MOE` in patch 24 with the fp8 scheme gate) or DeepGEMM adds sm_110.
+
+The tcgen05 switches were built against the v0.31.0 sources and **validated on real Thor
+hardware**: the image builds with `GPU_ARCH=110a`; the bf16x3 router GEMM matches an fp32
+reference bit-for-bit at toy shapes and is the one path armed by default; the FLASHINFER_CUTLASS
+MoE compiles `sm_110a` and was A/B-validated end to end (numbers in the table above,
+`scripts/validate_fi_cutlass.sh` reproduces); the trtllm-gen MoE cubins, trtllm-gen attention
+and the GDN DSL kernel were probed on the device, found SM10x/SM12x-only in flashinfer 0.7.0
+(forcing them crashes the boot), and therefore default off behind their env vars. Still: measure
+with `bench/perf.py` before trusting the numbers (and mind two bench traps that inflated early
+runs here: the very first long prefill after a boot pays one-time page-cache warm-up, and
+`bench/perf.py`'s prefill targets extend one another, so the prefix cache flatters the larger
+ones — use `bench/cold_prefill.py`'s nonce'd prompts for prefill numbers), and if a part
+regresses, switch it off by env and open an issue.
 
 ## Power model 4 (INFERENCE): the host-side knob
 

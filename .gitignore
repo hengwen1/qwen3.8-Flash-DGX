@@ -10,3 +10,4 @@ results/
 
 # pi session exports
 pi-session-*.html
+.fi-jit-cache/
