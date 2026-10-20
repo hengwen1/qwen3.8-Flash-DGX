@@ -47,6 +47,7 @@ shared network, use an authenticated gateway or set vLLM's `--api-key`. See
 | More shared KV capacity at 1M | `mtp4-1m` |
 | Shorter interruptions to active streams during long prefills | `shared` |
 | Previous MTP2 recipe, with reduced draft vocabulary | `mtp-standard` |
+| Jetson Thor (sm_110a) with the tcgen05 kernel paths | `thor` — see [Jetson Thor](docs/THOR.md) |
 
 ```bash
 ./flash profiles
@@ -135,6 +136,7 @@ With `published`, lower `CTX` if the engine reports a smaller KV ceiling.
 - [Serving reference](docs/SERVING.md) for the full profile list, tuning, TLS, diagnostics and benchmarks.
 - [vLLM 0.33](docs/VLLM-033.md) for upgrade details and measured workloads.
 - [How it works](docs/HOW-IT-WORKS.md) for PLE offload, hybrid weights and GB10 patches.
+- [Jetson Thor](docs/THOR.md) for the sm_110a build, the tcgen05 kernel paths and the host power model.
 - [Tool calling and Responses](docs/SAFE-OUTPUT.md) for parser behavior and validation.
 - [Project history](docs/HISTORY.md) for previous releases and benchmarks.
 - [Archived README](docs/README-ARCHIVE.md) for the full documentation before the rewrite.
