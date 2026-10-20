@@ -283,6 +283,17 @@ TCGEN05="${TCGEN05:-auto}"
 if [ "$TCGEN05" = auto ]; then
   if [ "$IS_THOR" = 1 ]; then TCGEN05=1; else TCGEN05=0; fi
 fi
+# Thor defaults (validated 2026-10-20): the FLASHINFER_CUTLASS NvFp4 MoE is on
+# (+18% cold prefill, +4% decode, sound numerics — README), with flashinfer's
+# JIT cache persisted under ~/.cache/qwen38-flash-dgx-compile so the ~25-min
+# fused_moe_100 compile happens once, in a side container, never next to a
+# loaded engine (Thor's unified memory OOM-kills that). Override either the
+# usual way: VLLM_THOR_TCGEN05_MOE=0 to fall back to stock VLLM_CUTLASS,
+# COMPILE_CACHE= (empty) for cache-in-container as before, or a custom path.
+if [ "$IS_THOR" = 1 ] && [ "$TCGEN05" = 1 ]; then
+  VLLM_THOR_TCGEN05_MOE="${VLLM_THOR_TCGEN05_MOE:-1}"
+  COMPILE_CACHE="${COMPILE_CACHE:-$HOME/.cache/qwen38-flash-dgx-compile}"
+fi
 # Jetson's nvidia-container-runtime rejects the --gpus all hook path outright
 # ("invoking the NVIDIA Container Runtime Hook directly is not supported");
 # the runtime path is the one that works there. GB10 keeps --gpus all.
@@ -292,11 +303,31 @@ if [ -n "${DOCKER_GPU_ARGS+x}" ]; then [ -n "$DOCKER_GPU_ARGS" ] && GPU_ARGS="$D
 elif [ "$IS_THOR" = 1 ]; then GPU_ARGS="--runtime=nvidia"; fi
 THORENV=()
 [ "$TCGEN05" = 1 ] && THORENV=(-e VLLM_THOR_TCGEN05=1)
-for THORPART in ATTN MOE GDN ROUTER; do
+for THORPART in ATTN MOE MOE_TRTLLM GDN ROUTER; do
   THORVAR="VLLM_THOR_TCGEN05_${THORPART}"
   THORVAL="${!THORVAR:-}"
   [ -n "$THORVAL" ] && THORENV+=(-e "${THORVAR}=$THORVAL")
 done
+# FLASHINFER_CUTLASS MoE (MOE=1) JIT-compiles fused_moe_100 (~25 min, several GB).
+# Thor's memory is unified, so that compile next to a loaded engine OOM-kills it —
+# pre-build the module into the COMPILE_CACHE volume *before* the engine starts.
+# Without COMPILE_CACHE there is nowhere durable to put it, so we only guard
+# when the volume is set; otherwise the boot JITs in place (and likely OOMs).
+if [ "${VLLM_THOR_TCGEN05_MOE:-}" = 1 ] && [ "$IS_THOR" = 1 ] \
+   && [ -n "${COMPILE_CACHE:-}" ] && [ "${COMPILE_CACHE:0:1}" = "/" ]; then
+  FI_SO="${COMPILE_CACHE}/flashinfer/0.7.0.post1/110a/cached_ops/fused_moe_100/fused_moe_100.so"
+  if [ ! -f "$FI_SO" ]; then
+    echo ">> VLLM_THOR_TCGEN05_MOE=1: flashinfer CUTLASS MoE not in COMPILE_CACHE;"
+    echo ">> building it now in a side container (one-time, ~25 min)..."
+    mkdir -p "${COMPILE_CACHE}/flashinfer"
+    docker run --rm --runtime=nvidia --ipc=host --entrypoint python3 \
+      -v "$SERVE_ROOT/bench/probe_fi_cutlass_moe.py:/tmp/probe.py:ro" \
+      -v "${COMPILE_CACHE}/flashinfer:/root/.cache/flashinfer" \
+      "$IMAGE" /tmp/probe.py >/dev/null 2>&1 || \
+      { echo "!! probe build failed — continuing; expect the engine boot to JIT (OOM risk)"; }
+    [ -f "$FI_SO" ] && echo ">> fused_moe_100.so built and cached."
+  fi
+fi
 case "$DRAFT_VOCAB" in
   0|"") ;;
   1) DETENV+=(-e VLLM_MTP_DRAFT_VOCAB=/opt/llm/draft_vocab_65536.npy) ;;
@@ -426,6 +457,6 @@ case "$STATE" in
     ;;
 esac
 
-echo ">> $NAME starting on :$PORT (platform=$PLATFORM, tcgen05=$TCGEN05, model '$SERVED_MODEL_NAME', mode=$MODE, ctx $CTX, yarn=$YARN, mtp=$MTP, seqs=$SEQS, prefix_cache=$PREFIX_CACHE, det_topk=$DET_TOPK, exact_topk=$EXACT_TOPK, draft_vocab=$DRAFT_VOCAB, madvise=$MADVISE, fast_rows=$FAST_ROWS, effort_alias=$EFFORT_ALIAS_STATE${CPUSET:+, cpuset=$CPUSET}${MAMBA_SSM_DTYPE:+, ssm_dtype=$MAMBA_SSM_DTYPE}${COMPILE_CACHE:+, compile_cache=$COMPILE_CACHE})"
+echo ">> $NAME starting on :$PORT (platform=$PLATFORM, tcgen05=$TCGEN05${VLLM_THOR_TCGEN05_MOE:+, fi_moe=$VLLM_THOR_TCGEN05_MOE}, model '$SERVED_MODEL_NAME', mode=$MODE, ctx $CTX, yarn=$YARN, mtp=$MTP, seqs=$SEQS, prefix_cache=$PREFIX_CACHE, det_topk=$DET_TOPK, exact_topk=$EXACT_TOPK, draft_vocab=$DRAFT_VOCAB, madvise=$MADVISE, fast_rows=$FAST_ROWS, effort_alias=$EFFORT_ALIAS_STATE${CPUSET:+, cpuset=$CPUSET}${MAMBA_SSM_DTYPE:+, ssm_dtype=$MAMBA_SSM_DTYPE}${COMPILE_CACHE:+, compile_cache=$COMPILE_CACHE})"
 echo ">> first boot loads ~75 GiB of weights (~3-4 min). Follow:  docker logs -f $NAME"
 echo ">> ready when the log says 'Application startup complete'. Then: scripts/smoke-test.sh"

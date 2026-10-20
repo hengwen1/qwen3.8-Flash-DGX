@@ -135,15 +135,18 @@ RUN cd ${SP} && patch --batch --forward --fuzz=0 -p1 < /tmp/qwen-mtp-aux-output.
 # --- 21. Opt-in tcgen05 kernel paths on Jetson Thor (sm_110a; VLLM_THOR_TCGEN05=1) ---
 # v0.31 gates every Blackwell tcgen05 kernel on sm_10x (family(100)) or major==10, so a
 # Thor silently gets the slow generic fallbacks even though the wheel ships sm_110f
-# cubins. This wires four gates behind runtime env checks — FlashInfer-first attention
-# priorities, the trtllm-gen NVFP4 fused MoE, the FlashInfer GDN prefill backend and the
-# bf16x3 cuTe-DSL router GEMM — each requiring capability family 110 AND the env var, so
-# it is inert on GB10 and on every upstream GPU without VLLM_THOR_TCGEN05=1.
+# cubins. This wires five gates behind runtime env checks — FlashInfer-first attention
+# priorities, the trtllm-gen NVFP4 fused MoE (dead until flashinfer ships Sm110a cubins),
+# the FLASHINFER_CUTLASS NVFP4 fused MoE (JITs from source, runs on sm_110a), the
+# FlashInfer GDN prefill backend and the bf16x3 cuTe-DSL router GEMM — each requiring
+# capability family 110 AND the env var, so it is inert on GB10 and on every upstream
+# GPU without VLLM_THOR_TCGEN05=1.
 # scripts/serve.sh sets the env automatically on detected Thor boxes (TCGEN05=auto).
 COPY src/patch_thor_tcgen05.py /tmp/patch_thor_tcgen05.py
 RUN python3 /tmp/patch_thor_tcgen05.py \
       ${SP}/vllm/platforms/cuda.py \
       ${SP}/vllm/model_executor/layers/fused_moe/experts/trtllm_nvfp4_moe.py \
+      ${SP}/vllm/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py \
       ${SP}/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py \
       ${SP}/vllm/model_executor/layers/fused_moe/router/gate_linear.py \
  && rm /tmp/patch_thor_tcgen05.py
