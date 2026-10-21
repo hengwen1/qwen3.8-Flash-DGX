@@ -142,7 +142,10 @@ own `DEFAULT` is **1 (`120W`)**; the usual reflex on a dev kit is `nvpmodel -m 0
 `jetson_clocks`. For this recipe run **power model 4, `INFERENCE`** — a custom entry added to this
 device's conf, tuned from the 120W model, whose comment says the whole thing: *"GPU at the
 OC3-clean ceiling (1395MHz), CPU/video/PVA capped to keep total SoC power under the thermal
-envelope (avoids MAXN throttle oscillation)"*.
+envelope (avoids MAXN throttle oscillation)"*. A second custom entry, **mode 5**
+(`INFERENCE_10C_MAXN_GPU`), takes the other side of the same trade — GPU uncapped at its 1575 MHz
+top, only `CORE_0-9` online — and is documented in [docs/POWER-MODE-5.md](docs/POWER-MODE-5.md);
+mode 4 stays the verified default.
 
 ```bash
 sudo nvpmodel -m 4        # applies live between models 0/1/4 — all three keep 14 cores online
@@ -155,6 +158,7 @@ nvpmodel -q --verbose | grep -E 'PARAM (GPU|EMC|CPU_AE_0):'   # REAL_VAL must eq
 | `0` MAXN | 14 | 2601 MHz | uncapped (sits at 1575 MHz) | 4266 MHz | nothing constrained: fastest clocks, highest power draw |
 | `1` 120W | 14 | 2601 MHz | 1386 MHz | 4266 MHz | the conf's `DEFAULT` — workable, just not the tuned setting |
 | **`4` INFERENCE** | **14** | **2268 MHz** | **1395 MHz** | **4266 MHz** | full core count and full memory clock, GPU pinned at the ceiling that runs clean, video/PVA down (this recipe uses neither) |
+| `5` INFERENCE_10C_MAXN_GPU | **10** | 2268 MHz | uncapped (sits at 1575 MHz) | 4266 MHz | custom: the OC3 fix on the CPU side instead of the GPU side — 4 cores off to buy the GPU its top clock, [own document](docs/POWER-MODE-5.md) |
 | `2`/`3` 90W/70W | **12** | 2601 / 1998 MHz | 1530 MHz | 4266 MHz | take two cores offline (`nvpmodel` asks for a reboot to do it) — wrong for a recipe that gathers the PLE table on the CPU |
 
 Measured on the dev kit this recipe was validated on — 128 GB, driver 595.78, the server exactly
