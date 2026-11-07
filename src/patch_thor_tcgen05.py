@@ -1,14 +1,35 @@
 #!/usr/bin/env python3
 """Opt-in tcgen05 kernel paths on Jetson Thor (sm_110a, compute capability 11.0).
 
-vLLM v0.31 steers every Blackwell-class tcgen05 kernel with
+vLLM steers every Blackwell-class tcgen05 kernel with
 ``is_device_capability_family(100)`` (sm_10x only) or ``major == 10``, so on a
 Thor (major 11) the engine silently picks slower generic fallbacks: the
 FlashAttention-first priority list instead of FlashInfer's trtllm-gen
-attention, a non-trtllm MoE for the NVFP4 routed experts, the Triton GDN
+attention, a non-flashinfer MoE for the NVFP4 routed experts, the Triton GDN
 prefill kernel, and cuBLAS for the MoE router GEMM. The wheel itself already
-ships sm_110f cubins (CMake builds ``11.0f`` on CUDA >= 13), so the kernels
-are there — only the gates keep them off.
+ships sm_110f cubins (CMake builds ``11.0f`` on CUDA >= 13; the published
+image also lists ``11.0`` in ``TORCH_CUDA_ARCH_LIST``), so the kernels are
+there — only the gates keep them off.
+
+Base: re-derived for **vLLM v0.33.0** (the pinned ``vllm/vllm-openai:v0.33.0``
+digest, build commit 4ba787e). The five anchor sites and their semantics are
+unchanged from the v0.31.0 derivation; what moved in 0.33 and was checked
+against it:
+  * ``fused_moe/oracle/nvfp4.py`` now picks the NvFp4 backend from an ordered
+    list — FLASHINFER_TRTLLM, FLASHINFER_CUTEDSL, CUTEDSL_BATCHED,
+    FLASHINFER_CUTLASS, VLLM_CUTLASS, ... Each is filtered through its
+    ``_supports_current_device()``, i.e. the gates patched here. The two
+    CuteDSL experts stay family(100)-only in 0.33, so a Thor still lands on
+    the re-armed FLASHINFER_CUTLASS part (MOE) — the ordering change does not
+    reorder anything on sm_110a.
+  * ``experts/cutlass_moe.py`` (stock VLLM_CUTLASS NvFp4) now accepts family
+    110 on its own, and ``vllm_flash_attn``'s FA4 guard accepts 11.x: both
+    need no patch.
+  * ``router/gate_linear.py`` gained a ``VLLM_BATCH_INVARIANT`` conjunct next
+    to ``is_blackwell``; the patched expression feeds both uses unchanged.
+  * ``mamba/gdn/qwen_gdn_linear_attn.py`` gained ROCm ``aiter_flydsl``
+    handling ahead of the CUDA branch; the CUDA gate sequence is identical.
+  * ``platforms/cuda.py::_get_backend_priorities`` is byte-identical.
 
 This patch extends five of those gates to capability family 110 behind runtime
 environment checks. Inert by default and on any other GPU: the injected
@@ -27,9 +48,10 @@ variable automatically on detected Thor boxes; disable per part with
           from source for the detected arch, and its sm100 module already
           accepts major 11 ("110" routes to gen_cutlass_fused_moe_sm100_module,
           supported_major_versions=[10, 11]; verified to compile and execute
-          on a Thor). Upstream v0.31 excludes SM110 here citing
-          flashinfer-ai/flashinfer#3134; this gate re-arms family 110 behind
-          the env check. DEFAULT OFF like the other flashinfer parts.
+          on a Thor). Upstream excludes SM110 here citing
+          flashinfer-ai/flashinfer#3134 (still excluded in 0.33); this gate
+          re-arms family 110 behind the env check. DEFAULT OFF like the other
+          flashinfer parts.
           NOTE: the first boot JIT-compiles the module (~25 min, several GB of
           RAM — on a Thor's unified memory that MUST NOT happen next to a
           loaded engine); pre-build with bench/probe_fi_cutlass_moe.py into a

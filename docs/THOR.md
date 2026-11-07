@@ -68,12 +68,15 @@ runs here: the very first long prefill after a boot pays one-time page-cache war
 ones — use `bench/cold_prefill.py`'s nonce'd prompts for prefill numbers), and if a part
 regresses, switch it off by env and open an issue.
 
-> **Base image note.** These gates were derived against the **vLLM v0.31.0** sources
-> and validated there. The recipe now builds on **vLLM v0.33**, whose modules moved:
-> re-verify the five injection points (`platforms/cuda.py`,
-> `fused_moe/experts/trtllm_nvfp4_moe.py`, `fused_moe/experts/flashinfer_cutlass_moe.py`,
-> `mamba/gdn/qwen_gdn_linear_attn.py`, `fused_moe/router/gate_linear.py`) and the
-> measurements below before relying on them on 0.33.
+> **Base image note.** The gates were first derived against **vLLM v0.31.0** and
+> re-derived for the pinned **vLLM v0.33.0** image (build commit `4ba787e`, whose five
+> patched modules are byte-identical to the v0.33.0 tag): the anchor sites and their
+> semantics are unchanged. What 0.33 changed and how it was checked is documented in
+> `src/patch_thor_tcgen05.py`, and `python3 src/test_thor_patch_cpu.py` re-runs the
+> install/idempotent/revert round trip plus the gate behaviour on a fake platform
+> (add `--sources <unpacked vllm tree>` to run it against real sources). The throughput
+> numbers below were still measured on the v0.31-based image — re-measure with
+> `bench/perf.py` before quoting them for a 0.33 build.
 
 ## Power model 4 (INFERENCE): the host-side knob
 

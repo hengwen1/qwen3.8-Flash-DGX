@@ -140,7 +140,8 @@ RUN cd ${SP} && patch --batch --forward --fuzz=0 -p1 < /tmp/qwen-parser-v033.pat
  && rm /tmp/qwen-parser-v033.patch
 
 # --- 24. Opt-in tcgen05 kernel paths on Jetson Thor (sm_110a; VLLM_THOR_TCGEN05=1) ---
-# NOTE: ported from the v0.31 recipe — re-derive against v0.33 before relying on it.
+# Re-derived against vLLM v0.33.0 (the pinned image digest, build commit 4ba787e): all
+# five anchor sites and their semantics are unchanged from the v0.31 derivation.
 # Every Blackwell tcgen05 kernel is gated on sm_10x (family(100)) or major==10, so a
 # Thor silently gets the slow generic fallbacks even though the wheel ships sm_110f
 # cubins. This wires five gates behind runtime env checks — FlashInfer-first attention
