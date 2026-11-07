@@ -387,37 +387,33 @@ done
 # pre-build the module into the COMPILE_CACHE volume *before* the engine starts.
 # Without COMPILE_CACHE there is nowhere durable to put it, so we only guard
 # when the volume is set; otherwise the boot JITs in place (and likely OOMs).
-# The cache path embeds the flashinfer version (0.7.0.post1 on the v0.31 image,
-# 0.7.2.post1 on v0.33), so match it with a glob instead of pinning one.
+# The kernel comes from flashinfer itself: newer wheels ship prebuilt cubins for
+# sm_110 (no JIT, no .so on disk), older ones JIT-compile on first call. Either
+# way the first call must not happen inside the engine (Thor's unified memory
+# OOM-kills a compile next to the loaded model), so run the probe once per
+# flashinfer version, in a side container, and stamp the result.
 if [ "${VLLM_THOR_TCGEN05_MOE:-}" = 1 ] && [ "$IS_THOR" = 1 ] \
    && [ -n "${COMPILE_CACHE:-}" ] && [ "${COMPILE_CACHE:0:1}" = "/" ]; then
   FI_CACHE_HOST="${COMPILE_CACHE}/flashinfer"
   mkdir -p "$FI_CACHE_HOST"
-  # The vLLM image runs `flashinfer download-kernels`, so it ships a prebuilt
-  # kernel cache in /root/.cache/flashinfer. The volume below shadows it, so
-  # seed an empty volume from the image first — otherwise a kernel the image
-  # already carries looks missing and gets JIT-rebuilt (or JITs at boot).
-  if [ -z "$(ls -A "$FI_CACHE_HOST" 2>/dev/null)" ]; then
-    echo ">> seeding the flashinfer cache from the image (prebuilt kernels)..."
-    docker run --rm --entrypoint /bin/sh -v "${FI_CACHE_HOST}:/seed" "$IMAGE" \
-      -c 'cp -a /root/.cache/flashinfer/. /seed/ 2>/dev/null || true' || true
-  fi
-  FI_SO=""
-  for cand in "$FI_CACHE_HOST"/*/110a/cached_ops/fused_moe_100/fused_moe_100.so; do
-    [ -f "$cand" ] && { FI_SO="$cand"; break; }
-  done
-  if [ -z "$FI_SO" ]; then
-    echo ">> VLLM_THOR_TCGEN05_MOE=1: flashinfer CUTLASS MoE not in COMPILE_CACHE;"
-    echo ">> building it now in a side container (one-time, ~25 min)..."
-    docker run --rm --runtime=nvidia --ipc=host --entrypoint python3 \
-      -v "$SERVE_ROOT/bench/probe_fi_cutlass_moe.py:/tmp/probe.py:ro" \
-      -v "${FI_CACHE_HOST}:/root/.cache/flashinfer" \
-      "$IMAGE" /tmp/probe.py >/dev/null 2>&1 || \
-      { echo "!! probe build failed — continuing; expect the engine boot to JIT (OOM risk)"; }
-    for cand in "$FI_CACHE_HOST"/*/110a/cached_ops/fused_moe_100/fused_moe_100.so; do
-      [ -f "$cand" ] && { FI_SO="$cand"; break; }
-    done
-    [ -n "$FI_SO" ] && echo ">> fused_moe_100.so built and cached."
+  FI_VER="$(docker run --rm --entrypoint python3 "$IMAGE" \
+    -c 'import flashinfer; print(flashinfer.__version__)' 2>/dev/null | tail -1)"
+  FI_VER="${FI_VER:-unknown}"
+  FI_STAMP="${FI_CACHE_HOST}/fi-cutlass-${FI_VER}-110a.ok"
+  if [ ! -f "$FI_STAMP" ]; then
+    echo ">> VLLM_THOR_TCGEN05_MOE=1: checking the flashinfer CUTLASS MoE kernel"
+    echo ">> (one-time per flashinfer version: $FI_VER; JIT-compiles here if the wheel has no sm_110 cubin)..."
+    if docker run --rm --runtime=nvidia --ipc=host --entrypoint python3 \
+         -v "$SERVE_ROOT/bench/probe_fi_cutlass_moe.py:/tmp/probe.py:ro" \
+         -v "${FI_CACHE_HOST}:/root/.cache/flashinfer" \
+         "$IMAGE" /tmp/probe.py > "${FI_CACHE_HOST}/probe-${FI_VER}.log" 2>&1; then
+      : > "$FI_STAMP"
+      echo ">> flashinfer CUTLASS MoE ready (log: ${FI_CACHE_HOST}/probe-${FI_VER}.log)."
+    else
+      echo "!! flashinfer CUTLASS MoE probe FAILED — see ${FI_CACHE_HOST}/probe-${FI_VER}.log."
+      echo "!! Continuing; if the engine JIT-compiles this kernel at boot it may OOM."
+      echo "!! Safer: VLLM_THOR_TCGEN05_MOE=0 ./flash serve thor (stock VLLM_CUTLASS)."
+    fi
   fi
 fi
 # VLLM_MTP_DRAFT_VOCAB prunes the MTP head's vocabulary. Under DRAFT_MODEL there is no MTP

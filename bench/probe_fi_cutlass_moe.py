@@ -8,6 +8,7 @@ Mirrors the nvfp4 path of vllm's FlashInferExperts.apply():
   - cutlass_fused_moe(quant_scales=[a1g, w1s, g1, a2g, w2s, g2])
 Compares against a bf16 reference MoE with the same routing.
 """
+import sys
 import time
 import torch
 import flashinfer
@@ -92,9 +93,11 @@ ref = torch.zeros(M, K, device=dev, dtype=torch.float32)
 for m in range(M):
     for j in range(TOPK):
         e = int(topi[m, j])
-        g = x[m].float() @ w13_dq_r[e, :N].T.float()
-        u = x[m].float() @ w13_dq_r[e, N:].T.float()
-        h = torch.nn.functional.silu(g) * u
+        # fc1 is reordered to [w3(up), w1(gate)] above, and the kernel computes
+        # silu(gate) * up — so the gate is the SECOND half of the reordered block.
+        up = x[m].float() @ w13_dq_r[e, :N].T.float()
+        gate = x[m].float() @ w13_dq_r[e, N:].T.float()
+        h = torch.nn.functional.silu(gate) * up
         o = h @ w2_dq[e].T.float()
         ref[m] += float(topw[m, j]) * o
 
@@ -132,4 +135,6 @@ cos = torch.nn.functional.cosine_similarity(o.flatten(), ref.flatten(), dim=0).i
 print(f"finite={finite} max_abs_err={err:.4f} rel={rel:.4f} cos={cos:.6f}")
 print("out sample:", o[0, :4].tolist())
 print("ref sample:", ref[0, :4].tolist())
-print("PROBE PASS" if finite and cos > 0.98 else "PROBE FAIL")
+ok = bool(finite) and cos > 0.98
+print("PROBE PASS" if ok else "PROBE FAIL")
+sys.exit(0 if ok else 1)
