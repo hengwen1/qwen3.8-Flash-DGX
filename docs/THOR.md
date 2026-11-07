@@ -74,9 +74,13 @@ regresses, switch it off by env and open an issue.
 > semantics are unchanged. What 0.33 changed and how it was checked is documented in
 > `src/patch_thor_tcgen05.py`, and `python3 src/test_thor_patch_cpu.py` re-runs the
 > install/idempotent/revert round trip plus the gate behaviour on a fake platform
-> (add `--sources <unpacked vllm tree>` to run it against real sources). The throughput
-> numbers below were still measured on the v0.31-based image — re-measure with
-> `bench/perf.py` before quoting them for a 0.33 build.
+> (add `--sources <unpacked vllm tree>` to run it against real sources). Two things to
+> re-probe on the 0.33 image before quoting the per-part defaults or the throughput
+> numbers below: they were measured on the **v0.31-based image**, which shipped
+> `flashinfer-python` **0.7.0**, while v0.33 pins **0.7.2.post1** — kernel availability
+> for sm_110 can differ, and the image now also runs `flashinfer download-kernels`, so
+> `serve.sh` seeds the flashinfer cache volume from the image before it considers a JIT
+> build.
 
 ## Power model 4 (INFERENCE): the host-side knob
 

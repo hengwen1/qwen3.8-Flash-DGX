@@ -387,19 +387,37 @@ done
 # pre-build the module into the COMPILE_CACHE volume *before* the engine starts.
 # Without COMPILE_CACHE there is nowhere durable to put it, so we only guard
 # when the volume is set; otherwise the boot JITs in place (and likely OOMs).
+# The cache path embeds the flashinfer version (0.7.0.post1 on the v0.31 image,
+# 0.7.2.post1 on v0.33), so match it with a glob instead of pinning one.
 if [ "${VLLM_THOR_TCGEN05_MOE:-}" = 1 ] && [ "$IS_THOR" = 1 ] \
    && [ -n "${COMPILE_CACHE:-}" ] && [ "${COMPILE_CACHE:0:1}" = "/" ]; then
-  FI_SO="${COMPILE_CACHE}/flashinfer/0.7.0.post1/110a/cached_ops/fused_moe_100/fused_moe_100.so"
-  if [ ! -f "$FI_SO" ]; then
+  FI_CACHE_HOST="${COMPILE_CACHE}/flashinfer"
+  mkdir -p "$FI_CACHE_HOST"
+  # The vLLM image runs `flashinfer download-kernels`, so it ships a prebuilt
+  # kernel cache in /root/.cache/flashinfer. The volume below shadows it, so
+  # seed an empty volume from the image first — otherwise a kernel the image
+  # already carries looks missing and gets JIT-rebuilt (or JITs at boot).
+  if [ -z "$(ls -A "$FI_CACHE_HOST" 2>/dev/null)" ]; then
+    echo ">> seeding the flashinfer cache from the image (prebuilt kernels)..."
+    docker run --rm --entrypoint /bin/sh -v "${FI_CACHE_HOST}:/seed" "$IMAGE" \
+      -c 'cp -a /root/.cache/flashinfer/. /seed/ 2>/dev/null || true' || true
+  fi
+  FI_SO=""
+  for cand in "$FI_CACHE_HOST"/*/110a/cached_ops/fused_moe_100/fused_moe_100.so; do
+    [ -f "$cand" ] && { FI_SO="$cand"; break; }
+  done
+  if [ -z "$FI_SO" ]; then
     echo ">> VLLM_THOR_TCGEN05_MOE=1: flashinfer CUTLASS MoE not in COMPILE_CACHE;"
     echo ">> building it now in a side container (one-time, ~25 min)..."
-    mkdir -p "${COMPILE_CACHE}/flashinfer"
     docker run --rm --runtime=nvidia --ipc=host --entrypoint python3 \
       -v "$SERVE_ROOT/bench/probe_fi_cutlass_moe.py:/tmp/probe.py:ro" \
-      -v "${COMPILE_CACHE}/flashinfer:/root/.cache/flashinfer" \
+      -v "${FI_CACHE_HOST}:/root/.cache/flashinfer" \
       "$IMAGE" /tmp/probe.py >/dev/null 2>&1 || \
       { echo "!! probe build failed — continuing; expect the engine boot to JIT (OOM risk)"; }
-    [ -f "$FI_SO" ] && echo ">> fused_moe_100.so built and cached."
+    for cand in "$FI_CACHE_HOST"/*/110a/cached_ops/fused_moe_100/fused_moe_100.so; do
+      [ -f "$cand" ] && { FI_SO="$cand"; break; }
+    done
+    [ -n "$FI_SO" ] && echo ">> fused_moe_100.so built and cached."
   fi
 fi
 # VLLM_MTP_DRAFT_VOCAB prunes the MTP head's vocabulary. Under DRAFT_MODEL there is no MTP

@@ -30,6 +30,10 @@ against it:
   * ``mamba/gdn/qwen_gdn_linear_attn.py`` gained ROCm ``aiter_flydsl``
     handling ahead of the CUDA branch; the CUDA gate sequence is identical.
   * ``platforms/cuda.py::_get_backend_priorities`` is byte-identical.
+The per-part DEFAULTS below were probed on the v0.31 image's flashinfer 0.7.0;
+the v0.33 image pins flashinfer-python 0.7.2.post1 and ships prebuilt kernels
+(``flashinfer download-kernels``), so re-probe them there with
+bench/probe_fi_cutlass_moe.py before trusting the defaults on a 0.33 build.
 
 This patch extends five of those gates to capability family 110 behind runtime
 environment checks. Inert by default and on any other GPU: the injected
