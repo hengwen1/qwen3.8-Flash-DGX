@@ -373,7 +373,7 @@ fi
 # the runtime path is the one that works there. GB10 keeps --gpus all.
 # DOCKER_GPU_ARGS overrides both (empty value = no GPU flag at all).
 GPU_ARGS="--gpus all"
-if [ -n "${DOCKER_GPU_ARGS+x}" ]; then [ -n "$DOCKER_GPU_ARGS" ] && GPU_ARGS="$DOCKER_GPU_ARGS"; 
+if [ -n "${DOCKER_GPU_ARGS+x}" ]; then [ -n "$DOCKER_GPU_ARGS" ] && GPU_ARGS="$DOCKER_GPU_ARGS";
 elif [ "$IS_THOR" = 1 ]; then GPU_ARGS="--runtime=nvidia"; fi
 THORENV=()
 [ "$TCGEN05" = 1 ] && THORENV=(-e VLLM_THOR_TCGEN05=1)
