@@ -70,4 +70,4 @@ echo "== phase 3: quick decode perf on FLASHINFER_CUTLASS =="
 COMPILE_CACHE="$CACHE" TCGEN05=1 VLLM_THOR_TCGEN05_MOE=1 ./scripts/serve.sh || exit 1
 wait_health || exit 1
 timeout 600 python3 bench/perf.py --port "$PORT" 2>/dev/null || \
-  echo "(bench/perf.py needs its usual args — run it manually; see README)"
+  echo "(bench/perf.py needs its usual args — run it manually; see docs/THOR.md)"

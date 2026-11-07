@@ -1,6 +1,6 @@
 # Power model 5 (`INFERENCE_10C_MAXN_GPU`): uncapped GPU, ten cores
 
-Companion to [README → Power model 4 (INFERENCE): the host-side knob](../README.md#power-model-4-inference-the-host-side-knob).
+Companion to [Jetson Thor → Power model 4 (INFERENCE): the host-side knob](THOR.md#power-model-4-inference-the-host-side-knob).
 Everything here is a **host** setting: `./flash` and `scripts/serve.sh` never touch it, and a
 second Thor running the same checkout needs it done again once per machine.
 
@@ -21,7 +21,7 @@ An uncapped GPU (`GPU MAX_FREQ -1`) sits at its 1575 MHz top under load. With **
 that draw trips soctherm's OC2/OC3 overcurrent events — measured on this box on 2026-10-20 at
 roughly **1,500 `oc3` events/minute** during sustained load, i.e. the part is being current-capped
 repeatedly rather than running free. Mode 4's 1395 MHz GPU ceiling is the point where that count
-goes to **0 events/min** and is the setting the README documents and benchmarks.
+goes to **0 events/min** and is the setting the Thor document and benchmarks.
 
 Mode 5 is the other way to the same goal: leave the GPU uncapped and remove the *simultaneously
 switching* CPU cores instead. Four cores offline (`CORE_10-13`) lowers the di/dt peak the power
@@ -137,13 +137,13 @@ nproc                                          # -> 10
 
 **Expect this one to ask for a reboot**, unlike the 0/1/4 switching that applies live. Models that
 change the *online core set* are the ones `nvpmodel` cannot always apply to a running kernel — that
-is already true of the stock `2`/`3` entries (see the README's table), and mode 5 moves four cores
+is already true of the stock `2`/`3` entries (see the power-model table in [Jetson Thor](THOR.md#power-model-4-inference-the-host-side-knob)), and mode 5 moves four cores
 instead of two. If `nvpmodel -q` reports mode 5 but `/sys/devices/system/cpu/online` still says
 `0-13`, the core offline never landed and the box is running mode 5's clocks with mode 0/4's
 topology: **the configuration this document is about to measure does not exist**. Reboot and recheck
 both lines before believing any number.
 
-To raise the CPU ceiling the way the README recommends for mode 4 (the 2268 MHz cap costs ~5% of
+To raise the CPU ceiling the way [Jetson Thor](THOR.md#power-model-4-inference-the-host-side-knob) recommends for mode 4 (the 2268 MHz cap costs ~5% of
 concurrent throughput, because every step gathers 16 rows of the mmapped PLE table on the CPU),
 note that four of the `cpufreq` nodes may be gone:
 
@@ -156,12 +156,12 @@ And keep the order: any later `nvpmodel -m …` rewrites the ceilings.
 ## What the recipe gains and loses — not measured
 
 The GPU-ceiling half of this trade is already quantified on this box, by the mode 0 vs mode 4 rows
-in the README: **+180 MHz of GPU is worth ~2% single-stream decode (47.1 vs 46.0 tok/s) and ~2%
+in [Jetson Thor](THOR.md#power-model-4-inference-the-host-side-knob): **+180 MHz of GPU is worth ~2% single-stream decode (47.1 vs 46.0 tok/s) and ~2%
 cold prefill (2,258 vs 2,206 tok/s)**, at +4 W median SoC power and +4 °C `Tj`.
 
 Treat that ~2% as a floor, and as evidence that is going stale. Those rows were measured on
 2026-10-19, one day **before** the FLASHINFER_CUTLASS NVFP4 MoE became the Thor default
-(2026-10-20, +18% cold prefill / +4% decode — see the README's tcgen05 table). A faster MoE kernel
+(2026-10-20, +18% cold prefill / +4% decode — see the tcgen05 table in [Jetson Thor](THOR.md)). A faster MoE kernel
 moves the same wall-clock budget into the GPU, which is exactly the resource mode 5 uncaps; the
 gap between "capped at 1395" and "free at 1575" is plausibly wider now than the 2% measured against
 the slower kernel path. Re-measure mode 4 vs mode 5 on the current default serve before reusing the
@@ -173,7 +173,7 @@ is exactly what loses four cores. Two mechanisms, both easy to check:
 
 - `WORKERS` defaults to 32 gather threads (`VLLM_PLE_MMAP_WORKERS`, [HOW-IT-WORKS](HOW-IT-WORKS.md))
   and was tuned on the GB10's 10 performance cores. On a 10-core Thor the fault-overlap trick that
-  buys +8%/+17% there (README, `FAST_ROWS=0`) is oversubscribed 3.2:1 against cores that also carry
+  buys +8%/+17% there (`FAST_ROWS=0`, [Jetson Thor](THOR.md)) is oversubscribed 3.2:1 against cores that also carry
   the engine's own CPU work.
 - A container pinned to cores that are offline gets its topology silently broken. On Thor `CPUSET`
   defaults to empty (all cores), which follows the online set and is safe. If you set `CPUSET`
@@ -182,7 +182,7 @@ is exactly what loses four cores. Two mechanisms, both easy to check:
 
 ## Measuring it before using it
 
-Reproduce the README's harness and add the event counter to the sampling loop:
+Reproduce the harness in [Jetson Thor](THOR.md) and add the event counter to the sampling loop:
 
 ```bash
 # the number that decides whether mode 5's premise holds: OC events per minute
@@ -190,7 +190,7 @@ sudo journalctl -k -d | grep -ci oc3               # per boot
 perf list | grep -i soctherm                       # PMU exposed? then poll during a round:
 #   perf stat -e 'soctherm:*' -a sleep 60
 
-# clocks + power at 0.5 s while it runs, as in the README's table
+# clocks + power at 0.5 s while it runs, as in the [Jetson Thor](THOR.md) table
 grep . /sys/class/devfreq/gpu-gpc-0/cur_freq       # actually at 1575, or capped somewhere else?
 cat /sys/class/hwmon/hwmon*/temp*_input /sys/class/hwmon/hwmon*/power*_input 2>/dev/null
 
@@ -198,12 +198,12 @@ python3 bench/perf.py                              # TTFT, single-stream, concur
 python3 bench/cold_prefill.py                      # nonce'd prompts: prefill without cache flattery
 ```
 
-For numbers comparable with the README's table, match its harness: the server as `./flash serve
+For numbers comparable with the [Jetson Thor](THOR.md) table, match its harness: the server as `./flash serve
 thor` starts it (hybrid, 500k, MTP=2), with `SEQS=8`, `GPU_MEM=0.80`, chunked prefill at 8192 and
-`VLLM_THOR_TCGEN05=1` — those three knobs are the README run's, not the `thor` profile's, so set
+`VLLM_THOR_TCGEN05=1` — those three knobs are the documented run's, not the `thor` profile's, so set
 them explicitly. Box otherwise idle, thinking off, three rounds of 8 streams × 900 tokens.
 `bench/perf.py` has no CLI for that: its rounds come from module defaults
-(`concurrency(levels=…, tokens=300)`) and its prefill targets extend one another, which the README
+(`concurrency(levels=…, tokens=300)`) and its prefill targets extend one another, which the Thor document
 flags as a prefix-cache flattery trap — use `bench/cold_prefill.py` for the prefill line.
 
 Judge the result on three axes, in this order: **OC3 count** (if it is still nonzero, mode 5's
@@ -212,7 +212,7 @@ aggregate decode** (the four lost cores), **`Tj` max** (the thermal envelope). T
 if you want the OC3-clean, documented point; mode 5 if the +2% of an uncapped GPU is worth more
 than the cores, which needs a number, not a hunch.
 
-To survive reboots, the mode 4 unit in the README works with two changes — the model number, and
+To survive reboots, the mode 4 unit in [Jetson Thor](THOR.md) works with two changes — the model number, and
 dropping the ceiling line if you want to stay at mode 5's own 2268 MHz:
 
 ```ini
@@ -243,9 +243,9 @@ it was.
 
 Mode 5 is a **configuration hypothesis with one supporting measurement**: the ~1,500 `oc3`/min at
 14 uncapped cores (2026-10-20) against 0/min at mode 4's 1395 MHz cap. Its performance on this
-recipe is unmeasured, and the mode 4 numbers in the README remain the reference. Keep mode 4 as the
+recipe is unmeasured, and the mode 4 numbers in [Jetson Thor](THOR.md) remain the reference. Keep mode 4 as the
 default until the measurements above say otherwise.
 
-Related: [README → Power model 4](../README.md#power-model-4-inference-the-host-side-knob) (the
+Related: [Jetson Thor → Power model 4](THOR.md#power-model-4-inference-the-host-side-knob) (the
 measured table this trades against), [HOW-IT-WORKS.md](HOW-IT-WORKS.md) (why the CPU is on the
 per-token critical path at all).

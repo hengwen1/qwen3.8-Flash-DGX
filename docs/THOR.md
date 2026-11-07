@@ -68,6 +68,13 @@ runs here: the very first long prefill after a boot pays one-time page-cache war
 ones — use `bench/cold_prefill.py`'s nonce'd prompts for prefill numbers), and if a part
 regresses, switch it off by env and open an issue.
 
+> **Base image note.** These gates were derived against the **vLLM v0.31.0** sources
+> and validated there. The recipe now builds on **vLLM v0.33**, whose modules moved:
+> re-verify the five injection points (`platforms/cuda.py`,
+> `fused_moe/experts/trtllm_nvfp4_moe.py`, `fused_moe/experts/flashinfer_cutlass_moe.py`,
+> `mamba/gdn/qwen_gdn_linear_attn.py`, `fused_moe/router/gate_linear.py`) and the
+> measurements below before relying on them on 0.33.
+
 ## Power model 4 (INFERENCE): the host-side knob
 
 Everything above happens inside the container; the other half of a Thor's throughput is set
